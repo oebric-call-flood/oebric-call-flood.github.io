@@ -14,7 +14,7 @@
       status.json  latest result per person (written with ETag If-Match = no lost updates)
       results/     one JSON file per call (If-None-Match:* = never overwritten)
       names.csv    optional: username,display_name (no passwords)
-  version: 2026-11-07 v1
+  version: 2026-11-08 v2 (weak ETag fix + visible errors)
 -->
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--ink:#1d2330;--mut:#667085;--line:#e3e6eb;--red:#c62828;--redbg:#fde8e7;--yel:#a76b00;--yelbg:#fff4d6;--grn:#2e7d32;--pri:#1f5fbf}
@@ -158,21 +158,24 @@ async function getFile(path, dir) {
   const r = await dav('GET', path, { dir });
   if (r.status === 404) return { text: null, etag: null };
   if (!r.ok) throw new Error('oc2 ตอบ ' + r.status + ' ที่ ' + path);
-  return { text: await r.text(), etag: r.headers.get('ETag') || r.headers.get('OC-ETag') };
+  // nginx turns the ETag into a weak one (W/"...") when it gzips the reply to a browser; If-Match needs the strong form.
+  const et = r.headers.get('OC-ETag') || r.headers.get('ETag');
+  return { text: await r.text(), etag: et ? et.replace(/^W\//, '') : null };
 }
 // Read-modify-write status.json safely: If-Match ETag, retry when someone else wrote in between.
 async function updateStatus(mutate) {
-  for (let i = 0; i < 8; i++) {
+  let conflicts = 0;
+  for (let i = 0; i < 6; i++) {
     const f = await getFile('status.json');
     const m = f.text ? JSON.parse(f.text) : {};
     const res = mutate(m);
     if (res && res.abort) return res;
     const r = await dav('PUT', 'status.json', { body: JSON.stringify(m), type: 'application/json; charset=utf-8', headers: f.etag ? { 'If-Match': f.etag } : { 'If-None-Match': '*' } });
-    if (r.status === 412) { await sleep(150 + Math.random() * 500 * (i + 1)); continue; }
+    if (r.status === 412) { conflicts++; await sleep(150 + Math.random() * 500 * (i + 1)); continue; }
     if (!r.ok) throw new Error('oc2 ตอบ ' + r.status + ' ตอนบันทึก status.json');
     return res || { ok: true };
   }
-  throw new Error('มีคนบันทึกพร้อมกันมาก ลองกดบันทึกอีกครั้ง');
+  throw new Error('oc2 ไม่ยอมให้เขียน status.json (412 x' + conflicts + ') — ถ้าไม่มีคนอื่นบันทึกพร้อมกัน แจ้งผู้ดูแล');
 }
 
 // ===================== login / PIN =====================
@@ -355,7 +358,7 @@ async function doLogout() { if (cur && !$('vForm').classList.contains('hide') &&
 async function start() {
   $('me').textContent = S.name; $('btnOut').classList.remove('hide'); $('vLogin').classList.add('hide'); show('list'); bumpIdle();
   $('list').innerHTML = '<p class="mut">กำลังโหลดรายชื่อ...</p>';
-  ALL = await run('getList');
+  try { ALL = await run('getList'); } catch (e) { $('list').innerHTML = '<p class="err">โหลดรายชื่อไม่ได้: ' + esc(e.message || e) + '</p>'; return; }
   const units = [...new Set(ALL.map(r => r.unit))].sort(); $('fUnit').innerHTML = '<option value="">ทุกหน่วย/ตำบล</option>' + units.map(u => `<option>${esc(u)}</option>`).join('');
   ['fStatus', 'fPri', 'fUnit'].forEach(i => $(i).onchange = () => render()); $('fq').oninput = () => render(); render();
 }
@@ -396,7 +399,13 @@ function radios(name, opts) { return `<div class="opt">${opts.map(o => `<label><
 function checks(name, opts) { return `<div class="opt">${opts.map(o => `<label><input type="checkbox" name="${name}" value="${o}">${o}</label>`).join('')}</div>`; }
 async function openForm(pid) {
   const r = ALL.find(x => x.pid === pid); cur = r;
-  const c = await run('claim', pid); if (!c.ok) { alert(c.msg); return; }
+  const btn = event && event.target && event.target.tagName === 'BUTTON' ? event.target : null;
+  if (btn) { btn.disabled = true; btn.textContent = 'กำลังจองเคส...'; }
+  let c;
+  try { c = await run('claim', pid); }
+  catch (e) { if (btn) { btn.disabled = false; btn.textContent = 'บันทึกผลการโทร'; } if (!['AUTH', 'NET'].includes(e.message)) alert('เปิดเคสไม่ได้: ' + (e.message || e)); return; }
+  if (btn) { btn.disabled = false; btn.textContent = 'บันทึกผลการโทร'; }
+  if (!c.ok) { alert(c.msg); return; }
   r.st = Object.assign(r.st || {}, { claimed_by: S.name });
   $('vForm').innerHTML = `<div class="card c-${cls(r.color)}"><div style="font-size:18px;font-weight:600">${esc(r.name)} <span class="mut">${esc(r.age)} ปี · ${esc(r.pid)}</span></div>
  <div class="mut">${esc(r.color_reason)}${r.equipment ? ' · ' + esc(r.equipment) : ''}</div>
@@ -465,7 +474,7 @@ async function save() {
   } catch (e) { $('ferr').textContent = 'บันทึกไม่สำเร็จ ลองอีกครั้ง (' + (e.message || e) + ')'; $('btnSave').disabled = false; $('btnSave').textContent = 'บันทึก'; }
 }
 async function loadSummary() {
-  show('sum'); $('vSum').innerHTML = '<p class="mut">กำลังโหลด...</p>'; const s = await run('getSummary');
+  show('sum'); $('vSum').innerHTML = '<p class="mut">กำลังโหลด...</p>'; let s; try { s = await run('getSummary'); } catch (e) { $('vSum').innerHTML = '<p class="err">โหลดสรุปไม่ได้: ' + esc(e.message || e) + '</p>'; return; }
   const kv = o => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<div>${esc(k)}<b>${v}</b></div>`).join('') || '<div class="mut">ยังไม่มี</div>';
   $('vSum').innerHTML = `<div class="tabs"><button class="ghost" onclick="show('list')">รายชื่อ</button><button onclick="loadSummary()">สรุปผล</button></div>
  <div class="stat"><div>ทั้งหมด<b>${s.total}</b></div><div>โทรแล้ว<b>${s.called}</b></div><div>คุยสำเร็จ<b>${s.done}</b></div><div>โทรไม่ติด ≥3 ครั้ง (ให้ อสม. เยี่ยม)<b>${s.noanswer3}</b></div>
