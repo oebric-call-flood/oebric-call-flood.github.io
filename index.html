@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="th"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https://oc2.dida.psu.ac.th; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex,nofollow">
+<title>โทรติดตามกลุ่มเปราะบาง</title>
+<!--
+  Call-tracking page that talks to ownCloud (oc2) DIRECTLY from the browser. No middle server, no Google.
+  - Contains NO data and NO passwords. Everything is read/written on oc2 with the caller's own account.
+  - Each caller: oc2 Settings -> Security -> add this page's domain to CORS + create an App password.
+  - Folder layout on oc2 (same as the Apps Script version):
+      list.csv     roster (read only)
+      status.json  latest result per person (written with ETag If-Match = no lost updates)
+      results/     one JSON file per call (If-None-Match:* = never overwritten)
+      names.csv    optional: username,display_name (no passwords)
+  version: 2026-11-07 v1
+-->
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--ink:#1d2330;--mut:#667085;--line:#e3e6eb;--red:#c62828;--redbg:#fde8e7;--yel:#a76b00;--yelbg:#fff4d6;--grn:#2e7d32;--pri:#1f5fbf}
+*{box-sizing:border-box}body{margin:0;font-family:-apple-system,"Sarabun","Noto Sans Thai",sans-serif;background:var(--bg);color:var(--ink);font-size:16px}
+header{position:sticky;top:0;background:#1f2a44;color:#fff;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;z-index:5}
+header b{font-size:17px}header small{opacity:.8}
+.wrap{padding:12px;max-width:760px;margin:auto}
+input,select,textarea{width:100%;font-size:16px;padding:10px;border:1px solid var(--line);border-radius:10px;background:#fff}
+button{font-size:16px;padding:11px 14px;border-radius:10px;border:0;background:var(--pri);color:#fff;cursor:pointer}
+button.ghost{background:#fff;color:var(--ink);border:1px solid var(--line)}
+button:disabled{opacity:.6}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1;min-width:130px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:10px 0}
+.c-แดง{border-left:6px solid var(--red)}.c-เหลือง{border-left:6px solid #e0a800}
+.tag{display:inline-block;padding:2px 8px;border-radius:99px;font-size:13px;margin-right:4px}
+.t-แดง{background:var(--redbg);color:var(--red)}.t-เหลือง{background:var(--yelbg);color:var(--yel)}.t-st{background:#eef1f5;color:#344054}
+.mut{color:var(--mut);font-size:14px}.tel{display:inline-block;margin:6px 8px 0 0;padding:8px 12px;background:#e8f1ff;color:var(--pri);border-radius:10px;text-decoration:none;font-weight:600}
+.opt{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 12px}.opt label{border:1px solid var(--line);border-radius:10px;padding:9px 11px;background:#fff}
+.opt input{width:auto;margin-right:6px}.opt label:has(input:checked){border-color:var(--pri);background:#e8f1ff}
+.q{font-weight:600;margin-top:10px}.hide{display:none}.err{color:var(--red)}
+.tabs{display:flex;gap:6px;margin-bottom:6px}.tabs button{flex:1}
+.stat{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}.stat div{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px}.stat b{font-size:22px;display:block}
+.prof{display:block;width:100%;text-align:left;margin:6px 0}
+.pin{letter-spacing:10px;font-size:24px;text-align:center}.pin::placeholder{letter-spacing:normal;font-size:16px}
+.note{background:#eef6ee;border:1px solid #cfe6cf;color:#24502a;border-radius:10px;padding:8px 10px;font-size:13px;margin-top:10px}
+.chk{display:flex;gap:8px;align-items:flex-start;margin:12px 0 6px}.chk input{width:auto;margin-top:3px}
+a{color:var(--pri)}
+</style></head><body>
+<header><b>โทรติดตามกลุ่มเปราะบาง</b><span><small id="me"></small> <button id="btnOut" class="ghost hide" style="font-size:13px;padding:5px 10px;margin-left:6px" onclick="doLogout()">ออกจากระบบ</button></span></header>
+<div class="wrap">
+ <div id="vLogin" class="card">
+  <!-- A: saved people on this device -->
+  <div id="lgProfiles" class="hide">
+   <div class="q">เลือกชื่อของคุณ</div>
+   <div id="profList"></div>
+   <button class="ghost" style="margin-top:8px" onclick="showNew()">เข้าด้วยบัญชีอื่น</button>
+  </div>
+  <!-- B: PIN -->
+  <div id="lgPin" class="hide">
+   <div class="q">ใส่ PIN ของ <span id="pinName"></span></div>
+   <input id="pinIn" class="pin" type="password" inputmode="numeric" maxlength="6" autocomplete="off" style="margin:8px 0">
+   <div class="row"><button class="ghost" onclick="showProfiles()">ย้อนกลับ</button><button id="btnUnlock" onclick="doUnlock()">เข้า</button></div>
+   <div class="mut" style="margin-top:10px">ลืม PIN? <a href="#" onclick="forgetProfile();return false">ลืมฉันจากเครื่องนี้</a> แล้วเข้าใหม่ด้วย App password</div>
+  </div>
+  <!-- C: first time / other account -->
+  <div id="lgNew" class="hide">
+   <div class="q">เข้าสู่ระบบด้วยบัญชี oc2</div>
+   <input id="u" placeholder="ชื่อผู้ใช้ oc2" autocomplete="username" autocapitalize="none" style="margin:8px 0">
+   <input id="p" type="password" placeholder="App password ของ oc2" autocomplete="current-password">
+   <div class="mut" style="margin-top:4px">สร้าง App password ที่ oc2 → Settings → Security</div>
+   <label class="chk"><input type="checkbox" id="rem" checked onchange="$('pinBox').classList.toggle('hide',!this.checked)"><span>จำไว้ในเครื่องนี้ แล้วครั้งต่อไปใช้แค่ PIN 6 หลัก</span></label>
+   <div id="pinBox">
+    <input id="pin1" class="pin" type="password" inputmode="numeric" maxlength="6" placeholder="ตั้ง PIN" autocomplete="off" style="margin:6px 0">
+    <input id="pin2" class="pin" type="password" inputmode="numeric" maxlength="6" placeholder="ยืนยัน PIN" autocomplete="off">
+    <div class="mut" style="margin-top:4px">ใส่ PIN ผิด 5 ครั้ง ระบบจะลบรหัสที่จำไว้ทิ้ง ต้องเข้าใหม่ด้วย App password</div>
+   </div>
+   <div class="row" style="margin-top:10px"><button class="ghost hide" id="btnBack" onclick="showProfiles()">ย้อนกลับ</button><button id="btnLogin" onclick="doLogin()">เข้าสู่ระบบ</button></div>
+   <details style="margin-top:10px"><summary class="mut">ตั้งค่าโฟลเดอร์ (เฉพาะเมื่อผู้ดูแลแจ้ง)</summary><input id="dirIn" placeholder="เช่น oc_app_real" style="margin-top:6px"></details>
+  </div>
+  <div id="lerr" class="err" style="margin-top:8px"></div>
+  <div class="note">🔒 หน้านี้ส่งข้อมูลตรงไปที่ oc2.dida.psu.ac.th ของ ม.อ. เท่านั้น ไม่ผ่านระบบอื่น · รหัสไม่ถูกเก็บในหน้าเว็บ</div>
+ </div>
+ <div id="vList" class="hide">
+  <div class="tabs"><button onclick="show('list')">รายชื่อ</button><button class="ghost" onclick="loadSummary()">สรุปผล</button></div>
+  <div class="row">
+   <select id="fStatus"><option value="todo">ยังไม่เสร็จ</option><option value="">ทั้งหมด</option><option value="ยังไม่โทร">ยังไม่โทร</option><option value="โทรไม่ติด">โทรไม่ติด</option><option value="เสร็จ">เสร็จ</option><option value="แผนเทศบาล">แผนเทศบาล</option><option value="nophone">ไม่มีเบอร์</option></select>
+   <select id="fPri"><option value="">ทุกลำดับ</option><option value="1">แดง 1 พึ่งอุปกรณ์</option><option value="2">แดง 2 ติดเตียง</option><option value="3">แดง 3</option><option value="4">เหลือง 4</option></select>
+   <select id="fUnit"><option value="">ทุกหน่วย/ตำบล</option></select>
+  </div>
+  <input id="fq" placeholder="ค้นหาชื่อ / รหัส / ชุมชน" style="margin-top:8px">
+  <div class="mut" id="cnt" style="margin-top:8px"></div>
+  <div id="list"></div>
+  <div style="text-align:center"><button class="ghost" id="more" onclick="render(true)">แสดงเพิ่ม</button></div>
+ </div>
+ <div id="vSum" class="hide"></div>
+ <div id="vForm" class="hide"></div>
+</div>
+<script>
+'use strict';
+// ===================== settings =====================
+const CFG = {
+  OC_URL: 'https://oc2.dida.psu.ac.th',
+  // Folder of the call data inside each person's oc2 view. Tried in order; the first one that has list.csv wins.
+  // Owner sees the full path; people the folder is shared with see it at their top level (or under Shared/).
+  DIRS: ['project_Cowork/active_project/list_special_pop/oc_app_test', 'oc_app_test', 'Shared/oc_app_test'],
+  CLAIM_MIN: 20,      // a claimed case is held for this many minutes
+  IDLE_MIN: 30,       // lock the page (back to PIN) after this many idle minutes
+  PIN_TRIES: 5,       // wrong PINs before the saved password is wiped from this device
+  KDF_ITER: 600000    // PBKDF2 iterations for the PIN
+};
+const STORE_KEY = 'callapp_profiles_v1';
+
+// ===================== session (memory only) =====================
+let S = { user: '', uid: '', pass: '', name: '', dir: '' };
+let ALL = [], shown = 0, cur = null, pendingProfile = null;
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ===================== small helpers =====================
+function b64(bytes) { let s = ''; bytes.forEach(b => s += String.fromCharCode(b)); return btoa(s); }
+function unb64(s) { return Uint8Array.from(atob(s), c => c.charCodeAt(0)); }
+function basic(u, p) { return 'Basic ' + b64(new TextEncoder().encode(u + ':' + p)); }
+function bkk(d, withSec) { // Asia/Bangkok wall clock parts
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).formatToParts(d).map(x => [x.type, x.value]));
+  return p;
+}
+function rand6() { return b64(crypto.getRandomValues(new Uint8Array(6))).replace(/[^A-Za-z0-9]/g, '').slice(0, 6).toLowerCase() || 'x'; }
+function csvParse(text) {
+  text = String(text || '').replace(/^﻿/, '');
+  const rows = []; let row = [], f = '', q = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) { if (c === '"') { if (text[i + 1] === '"') { f += '"'; i++; } else q = false; } else f += c; }
+    else if (c === '"') q = true;
+    else if (c === ',') { row.push(f); f = ''; }
+    else if (c === '\n') { row.push(f); rows.push(row); row = []; f = ''; }
+    else if (c !== '\r') f += c;
+  }
+  if (f !== '' || row.length) { row.push(f); rows.push(row); }
+  if (!rows.length) return [];
+  const h = rows.shift().map(s => s.trim());
+  return rows.filter(r => r.join('') !== '').map(r => Object.fromEntries(h.map((k, i) => [k, r[i] == null ? '' : r[i]])));
+}
+
+// ===================== oc2 WebDAV =====================
+function davUrl(path, dir) {
+  const parts = ((dir == null ? S.dir : dir) + '/' + (path || '')).split('/').filter(Boolean).map(encodeURIComponent);
+  return CFG.OC_URL + '/remote.php/dav/files/' + encodeURIComponent(S.uid) + '/' + parts.join('/');
+}
+async function dav(method, path, opt) {
+  opt = opt || {};
+  const h = Object.assign({ Authorization: basic(S.user, S.pass) }, opt.headers || {});
+  if (opt.type) h['Content-Type'] = opt.type;
+  let r;
+  try { r = await fetch(davUrl(path, opt.dir), { method, headers: h, body: opt.body, cache: 'no-store', credentials: 'omit', mode: 'cors' }); }
+  catch (e) { throw new Error('NET'); }
+  if (r.status === 401) throw new Error('AUTH');
+  return r;
+}
+async function getFile(path, dir) {
+  const r = await dav('GET', path, { dir });
+  if (r.status === 404) return { text: null, etag: null };
+  if (!r.ok) throw new Error('oc2 ตอบ ' + r.status + ' ที่ ' + path);
+  return { text: await r.text(), etag: r.headers.get('ETag') || r.headers.get('OC-ETag') };
+}
+// Read-modify-write status.json safely: If-Match ETag, retry when someone else wrote in between.
+async function updateStatus(mutate) {
+  for (let i = 0; i < 8; i++) {
+    const f = await getFile('status.json');
+    const m = f.text ? JSON.parse(f.text) : {};
+    const res = mutate(m);
+    if (res && res.abort) return res;
+    const r = await dav('PUT', 'status.json', { body: JSON.stringify(m), type: 'application/json; charset=utf-8', headers: f.etag ? { 'If-Match': f.etag } : { 'If-None-Match': '*' } });
+    if (r.status === 412) { await sleep(150 + Math.random() * 500 * (i + 1)); continue; }
+    if (!r.ok) throw new Error('oc2 ตอบ ' + r.status + ' ตอนบันทึก status.json');
+    return res || { ok: true };
+  }
+  throw new Error('มีคนบันทึกพร้อมกันมาก ลองกดบันทึกอีกครั้ง');
+}
+
+// ===================== login / PIN =====================
+function profiles() { try { return JSON.parse(localStorage.getItem(STORE_KEY) || '{}'); } catch (e) { return {}; } }
+function saveProfiles(p) { try { localStorage.setItem(STORE_KEY, JSON.stringify(p)); } catch (e) { } }
+async function pinKey(pin, salt) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pin), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: CFG.KDF_ITER, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+}
+function weakPin(p) {
+  if (!/^\d{6}$/.test(p)) return 'PIN ต้องเป็นตัวเลข 6 หลัก';
+  if (/^(\d)\1{5}$/.test(p) || '0123456789'.includes(p) || '9876543210'.includes(p)) return 'PIN ง่ายเกินไป (เลขซ้ำหรือเรียงกัน)';
+  return '';
+}
+// Find who this is on oc2 and which folder holds the data. Returns null if wrong password.
+async function connect(user, pass, dirOverride) {
+  S = { user, uid: user, pass, name: user, dir: '' };
+  try { // real user id + display name (login name can differ from the id)
+    const r = await fetch(CFG.OC_URL + '/ocs/v1.php/cloud/user?format=json', { headers: { Authorization: basic(user, pass), 'OCS-APIREQUEST': 'true' }, cache: 'no-store', credentials: 'omit' });
+    if (r.status === 401) throw new Error('AUTH');
+    if (r.ok) { const j = await r.json(); const d = j && j.ocs && j.ocs.data; if (d && d.id) { S.uid = d.id; S.name = d['display-name'] || d.id; } }
+  } catch (e) { if (e.message === 'AUTH') throw e; }
+  const dirs = dirOverride ? [dirOverride] : CFG.DIRS;
+  for (const d of dirs) {
+    const r = await dav('GET', 'list.csv', { dir: d });
+    if (r.ok) { S.dir = d; break; }
+  }
+  if (!S.dir) throw new Error('NODIR');
+  try { // optional nicknames
+    const f = await getFile('names.csv');
+    if (f.text) { const n = csvParse(f.text).find(x => [S.uid, S.user].includes(String(x.username).trim())); if (n && n.display_name) S.name = n.display_name; }
+  } catch (e) { if (e.message === 'AUTH') throw e; }
+  return true;
+}
+function loginErr(e) {
+  const m = String(e && e.message || e);
+  if (m === 'AUTH') return 'ชื่อผู้ใช้หรือ App password ไม่ถูกต้อง';
+  if (m === 'NODIR') return 'เข้า oc2 ได้ แต่ไม่พบโฟลเดอร์งานโทร — ยังไม่ได้รับแชร์โฟลเดอร์ หรือชื่อโฟลเดอร์ไม่ตรง';
+  if (m === 'NET') return 'เข้าไม่ได้ — ชื่อผู้ใช้หรือ App password ไม่ถูก, หรือยังไม่ได้เพิ่มโดเมนนี้ใน oc2 → Settings → Security → CORS, หรืออินเทอร์เน็ตมีปัญหา';
+  return m;
+}
+async function doLogin() {
+  const user = $('u').value.trim(), pass = $('p').value.trim(), rem = $('rem').checked;
+  if (!user || !pass) { $('lerr').textContent = 'กรุณาใส่ชื่อผู้ใช้และ App password'; return; }
+  if (rem) {
+    const w = weakPin($('pin1').value); if (w) { $('lerr').textContent = w; return; }
+    if ($('pin1').value !== $('pin2').value) { $('lerr').textContent = 'PIN สองช่องไม่ตรงกัน'; return; }
+  }
+  $('btnLogin').disabled = true; $('lerr').textContent = 'กำลังตรวจสอบกับ oc2...';
+  try {
+    await connect(user, pass, $('dirIn').value.trim());
+    if (rem) {
+      const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+      const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await pinKey($('pin1').value, salt), new TextEncoder().encode(pass)));
+      const P = profiles(); P[S.uid] = { user: S.user, uid: S.uid, name: S.name, dir: S.dir, salt: b64(salt), iv: b64(iv), ct: b64(ct), fails: 0 }; saveProfiles(P);
+    }
+    $('p').value = ''; $('pin1').value = ''; $('pin2').value = '';
+    start();
+  } catch (e) { S = { user: '', uid: '', pass: '', name: '', dir: '' }; $('lerr').textContent = loginErr(e); }
+  finally { $('btnLogin').disabled = false; }
+}
+async function doUnlock() {
+  const P = profiles(), pr = P[pendingProfile]; if (!pr) { showProfiles(); return; }
+  const pin = $('pinIn').value; $('btnUnlock').disabled = true; $('lerr').textContent = 'กำลังตรวจ PIN...';
+  let pass = null;
+  try { pass = new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(pr.iv) }, await pinKey(pin, unb64(pr.salt)), unb64(pr.ct))); } catch (e) { pass = null; }
+  $('btnUnlock').disabled = false; $('pinIn').value = '';
+  if (pass === null) {
+    pr.fails = (pr.fails || 0) + 1;
+    if (pr.fails >= CFG.PIN_TRIES) { delete P[pendingProfile]; saveProfiles(P); $('lerr').textContent = 'PIN ผิดครบ ' + CFG.PIN_TRIES + ' ครั้ง ลบรหัสที่จำไว้ในเครื่องนี้แล้ว — เข้าใหม่ด้วย App password'; showNew(true); return; }
+    saveProfiles(P); $('lerr').textContent = 'PIN ไม่ถูกต้อง (เหลืออีก ' + (CFG.PIN_TRIES - pr.fails) + ' ครั้ง)'; return;
+  }
+  pr.fails = 0; saveProfiles(P);
+  try { await connect(pr.user, pass, pr.dir); start(); }
+  catch (e) {
+    if (e.message === 'AUTH') { delete P[pendingProfile]; saveProfiles(P); $('lerr').textContent = 'App password นี้ถูกยกเลิกแล้วที่ oc2 — ลบออกจากเครื่องนี้แล้ว เข้าใหม่ด้วย App password ตัวใหม่'; showNew(true); }
+    else $('lerr').textContent = loginErr(e);
+  }
+}
+function forgetProfile() {
+  const P = profiles(); if (!P[pendingProfile]) return;
+  if (!confirm('ลบรหัสของ ' + P[pendingProfile].name + ' ออกจากเครื่องนี้?')) return;
+  delete P[pendingProfile]; saveProfiles(P); $('lerr').textContent = 'ลบออกจากเครื่องนี้แล้ว'; showProfiles();
+}
+function loginView(which) { ['lgProfiles', 'lgPin', 'lgNew'].forEach(x => $(x).classList.toggle('hide', x !== which)); }
+function showProfiles() {
+  const P = profiles(), keys = Object.keys(P);
+  if (!keys.length) { showNew(true); return; }
+  $('profList').innerHTML = keys.map(k => `<button class="ghost prof" onclick="pickProfile('${esc(k)}')">👤 ${esc(P[k].name)} <span class="mut">(${esc(P[k].user)})</span></button>`).join('');
+  loginView('lgProfiles');
+}
+function pickProfile(k) { pendingProfile = k; $('pinName').textContent = (profiles()[k] || {}).name || k; $('lerr').textContent = ''; loginView('lgPin'); setTimeout(() => $('pinIn').focus(), 50); }
+function showNew(keepMsg) { if (!keepMsg) $('lerr').textContent = ''; $('btnBack').classList.toggle('hide', !Object.keys(profiles()).length); loginView('lgNew'); }
+
+// idle lock: forget the password from memory, back to PIN screen
+let idleT = null;
+function bumpIdle() { clearTimeout(idleT); if (S.pass) idleT = setTimeout(() => { S.pass = ''; location.reload(); }, CFG.IDLE_MIN * 60000); }
+['click', 'keydown', 'touchstart', 'scroll'].forEach(ev => addEventListener(ev, bumpIdle, { passive: true }));
+
+// ===================== API (same functions the Apps Script version had) =====================
+const API = {
+  async getList() {
+    const [L, f] = await Promise.all([getFile('list.csv'), getFile('status.json')]);
+    const st = f.text ? JSON.parse(f.text) : {};
+    return csvParse(L.text).map(r => Object.assign({}, r, { st: st[r.pid] || null }));
+  },
+  async claim(pid) {
+    const me = S.name, now = new Date();
+    return updateStatus(m => {
+      const x = m[pid];
+      if (x && x.claimed_by && x.claimed_by !== me && x.claimed_at && (now - new Date(x.claimed_at)) < CFG.CLAIM_MIN * 60000)
+        return { abort: true, ok: false, msg: 'เคสนี้ ' + x.claimed_by + ' กำลังโทรอยู่' };
+      m[pid] = Object.assign(x || { pid, status: 'ยังไม่โทร', attempts: 0 }, { claimed_by: me, claimed_at: now.toISOString() });
+      return { ok: true };
+    });
+  },
+  async release(pid) {
+    const me = S.name;
+    return updateStatus(m => { if (m[pid] && m[pid].claimed_by === me) { m[pid].claimed_by = ''; m[pid].claimed_at = ''; return { ok: true }; } return { abort: true, ok: true }; });
+  },
+  async submit(d) {
+    const me = S.name, now = new Date(), t = bkk(now);
+    // 0) guard: someone else holds this case right now -> do not save over them
+    const f0 = await getFile('status.json'), c0 = (f0.text ? JSON.parse(f0.text) : {})[d.pid];
+    if (c0 && c0.claimed_by && c0.claimed_by !== me && c0.claimed_at && (now - new Date(c0.claimed_at)) < CFG.CLAIM_MIN * 60000)
+      return { ok: false, msg: 'บันทึกไม่ได้: เคสนี้ ' + c0.claimed_by + ' กำลังโทรอยู่' };
+    // 1) history: one file per call, never overwritten
+    const stamp = `${t.year}${t.month}${t.day}T${t.hour}${t.minute}${t.second}`;
+    const rec = Object.assign({ timestamp: `${t.year}-${t.month}-${t.day} ${t.hour}:${t.minute}:${t.second}`, caller: me, caller_account: S.uid }, d);
+    const r = await dav('PUT', 'results/' + d.pid + '_' + stamp + '_' + rand6() + '.json', { body: JSON.stringify(rec), type: 'application/json; charset=utf-8', headers: { 'If-None-Match': '*' } });
+    if (!r.ok) throw new Error('oc2 ตอบ ' + r.status + ' ตอนบันทึกประวัติ');
+    // 2) latest status per person
+    let status = 'เสร็จ';
+    if (d.call_result === 'ไม่รับสาย/ปิดเครื่อง') status = 'โทรไม่ติด';
+    else if (d.call_result === 'เบอร์ผิด/ไม่มีเบอร์นี้') status = 'เบอร์ผิด';
+    else if (d.call_result === 'ย้ายออกจากพื้นที่' || d.call_result === 'เสียชีวิต') status = d.call_result;
+    let attempts = 0;
+    await updateStatus(m => {
+      const prev = m[d.pid] || {}; attempts = Number(prev.attempts || 0) + 1;
+      m[d.pid] = { pid: d.pid, status, attempts, claimed_by: '', claimed_at: '', last_result: d.call_result,
+        will_move: d.will_move || '', dest: d.dest || '', by_whom: d.by_whom || '', pickup_mode: d.pickup_mode || '',
+        companions: d.companions || '', center_equipment: d.center_equipment || '', new_phone: d.new_phone || prev.new_phone || '',
+        updated_at: `${t.day}/${t.month}/${t.year} ${t.hour}:${t.minute}`, updated_by: me, regular_ride: d.regular_ride || '', ride_use: d.ride_use || '' };
+    });
+    return { ok: true, status, attempts };
+  },
+  async logout() {
+    const me = S.name;
+    try { await updateStatus(m => { let ch = false; Object.keys(m).forEach(k => { if (m[k].claimed_by === me) { m[k].claimed_by = ''; m[k].claimed_at = ''; ch = true; } }); return ch ? { ok: true } : { abort: true, ok: true }; }); } catch (e) { }
+    return { ok: true };
+  },
+  async getSummary() {
+    const [Lf, f] = await Promise.all([getFile('list.csv'), getFile('status.json')]);
+    const L = csvParse(Lf.text), st = f.text ? JSON.parse(f.text) : {};
+    const s = { total: L.length, called: 0, done: 0, noanswer3: 0, move: 0, nomove: 0, unsure: 0, pickup: 0, ride: 0, rideSelf: 0, pickupUnconfirmed: 0, dest: {}, pickupByTambon: {} };
+    L.forEach(r => {
+      const x = st[r.pid]; if (!x || !x.status || x.status === 'ยังไม่โทร') return;
+      s.called++;
+      if (x.status === 'เสร็จ') s.done++;
+      if (x.status === 'โทรไม่ติด' && Number(x.attempts) >= 3) s.noanswer3++;
+      if (x.will_move === 'ย้าย') s.move++; else if (x.will_move === 'ไม่ย้าย') s.nomove++; else if (x.will_move === 'ยังไม่แน่ใจ') s.unsure++;
+      if (x.dest) s.dest[x.dest] = (s.dest[x.dest] || 0) + 1;
+      if (x.by_whom === 'ต้องให้หน่วยงานไปรับ') { s.pickup++; s.pickupByTambon[r.tambon] = (s.pickupByTambon[r.tambon] || 0) + 1; }
+      if (x.regular_ride === 'มี') { s.ride++; if (x.ride_use === 'ใช้รถนี้ไปเอง') s.rideSelf++; if (x.by_whom === 'ต้องให้หน่วยงานไปรับ' && !x.ride_use) s.pickupUnconfirmed++; }
+    });
+    return s;
+  }
+};
+async function run(fn, ...a) {
+  try { return await API[fn](...a); }
+  catch (e) {
+    if (e.message === 'AUTH') { alert('oc2 ไม่ยอมรับรหัสแล้ว (App password อาจถูกยกเลิก) กรุณาเข้าใหม่'); location.reload(); }
+    if (e.message === 'NET') alert('ติดต่อ oc2 ไม่ได้ ตรวจอินเทอร์เน็ตแล้วลองใหม่');
+    throw e;
+  }
+}
+
+// ===================== screens (same as the team's current form) =====================
+async function doLogout() { if (cur && !$('vForm').classList.contains('hide') && !confirm('ยังไม่ได้บันทึกเคสนี้ ออกจากระบบเลยไหม')) return; try { await run('logout'); } catch (e) { } S = { user: '', uid: '', pass: '', name: '', dir: '' }; location.reload(); }
+async function start() {
+  $('me').textContent = S.name; $('btnOut').classList.remove('hide'); $('vLogin').classList.add('hide'); show('list'); bumpIdle();
+  $('list').innerHTML = '<p class="mut">กำลังโหลดรายชื่อ...</p>';
+  ALL = await run('getList');
+  const units = [...new Set(ALL.map(r => r.unit))].sort(); $('fUnit').innerHTML = '<option value="">ทุกหน่วย/ตำบล</option>' + units.map(u => `<option>${esc(u)}</option>`).join('');
+  ['fStatus', 'fPri', 'fUnit'].forEach(i => $(i).onchange = () => render()); $('fq').oninput = () => render(); render();
+}
+function show(v) { ['vList', 'vSum', 'vForm'].forEach(x => $(x).classList.add('hide')); $({ list: 'vList', sum: 'vSum', form: 'vForm' }[v]).classList.remove('hide'); window.scrollTo(0, 0); }
+function stOf(r) { return r.st && r.st.status ? r.st.status : 'ยังไม่โทร'; }
+function filt() {
+  const s = $('fStatus').value, p = $('fPri').value, u = $('fUnit').value, q = $('fq').value.trim();
+  return ALL.filter(r => {
+    const st = stOf(r);
+    if (s === 'todo' && !(st === 'ยังไม่โทร' || st === 'โทรไม่ติด')) return false;
+    if (s === 'nophone' && r.phone1) return false;
+    if (s && s !== 'todo' && s !== 'nophone' && st !== s) return false;
+    if (p && String(r.priority) !== p) return false; if (u && r.unit !== u) return false;
+    if (q && !(r.name + r.pid + r.community + r.address).includes(q)) return false; return true;
+  });
+}
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function cls(s) { return String(s || '').replace(/[^฀-๿a-zA-Z0-9_-]/g, ''); }
+function tels(r) { return [r.phone1, ...String(r.phone2 || '').split('/'), r.st && r.st.new_phone].map(x => String(x || '').replace(/\D/g, '')).filter((x, i, a) => x.length >= 9 && a.indexOf(x) === i); }
+function render(more) {
+  const F = filt(); if (!more) shown = 0; const n = shown + 40;
+  $('cnt').textContent = `พบ ${F.length} คน`;
+  const h = F.slice(shown, n).map(r => {
+    const st = stOf(r), t = tels(r); return `<div class="card c-${cls(r.color)}">
+  <div><span class="tag t-${cls(r.color)}">${esc(r.color)} ${esc(r.priority)}</span><span class="tag t-st">${esc(st)}${r.st && r.st.attempts > 0 ? ' (' + esc(r.st.attempts) + ' ครั้ง)' : ''}</span>${r.st && r.st.claimed_by ? '<span class="tag t-st">กำลังโทร: ' + esc(r.st.claimed_by) + '</span>' : ''}</div>
+  <div style="font-size:18px;font-weight:600;margin-top:6px">${esc(r.name)} <span class="mut">${esc(r.age)} ปี · ${esc(r.pid)}</span></div>
+  <div class="mut">${esc([r.address, r.moo ? 'ม.' + r.moo : '', r.community, r.tambon].filter(Boolean).join(' '))} · ${esc(r.unit)}</div>
+  <div class="mut">${esc(r.color_reason)}${r.vuln ? ' · ' + esc(r.vuln) : ''}${r.equipment ? ' · อุปกรณ์: ' + esc(r.equipment) : ''}</div>
+  ${r.dup_flag ? '<div class="err" style="font-size:14px">ข้อมูลต้องตรวจ: ' + esc(r.dup_flag) + '</div>' : ''}
+  ${r.osm ? `<div class="mut">อสม.: ${esc(r.osm)}</div>` : ''}
+  <div>${t.map(x => `<a class="tel" href="tel:${x}">📞 ${x}</a>`).join('') || '<span class="err">ยังไม่มีเบอร์</span>'}</div>
+  <div style="margin-top:8px"><button onclick="openForm('${esc(r.pid)}')">บันทึกผลการโทร</button></div></div>`;
+  }).join('');
+  if (more) $('list').insertAdjacentHTML('beforeend', h); else $('list').innerHTML = h || '<p class="mut">ไม่มีรายชื่อตามเงื่อนไข</p>';
+  shown = Math.min(n, F.length); $('more').style.display = shown < F.length ? '' : 'none';
+}
+function radios(name, opts) { return `<div class="opt">${opts.map(o => `<label><input type="radio" name="${name}" value="${o}">${o}</label>`).join('')}</div>`; }
+function checks(name, opts) { return `<div class="opt">${opts.map(o => `<label><input type="checkbox" name="${name}" value="${o}">${o}</label>`).join('')}</div>`; }
+async function openForm(pid) {
+  const r = ALL.find(x => x.pid === pid); cur = r;
+  const c = await run('claim', pid); if (!c.ok) { alert(c.msg); return; }
+  r.st = Object.assign(r.st || {}, { claimed_by: S.name });
+  $('vForm').innerHTML = `<div class="card c-${cls(r.color)}"><div style="font-size:18px;font-weight:600">${esc(r.name)} <span class="mut">${esc(r.age)} ปี · ${esc(r.pid)}</span></div>
+ <div class="mut">${esc(r.color_reason)}${r.equipment ? ' · ' + esc(r.equipment) : ''}</div>
+ ${r.dup_flag ? '<div class="err" style="font-size:14px">ข้อมูลต้องตรวจ: ' + esc(r.dup_flag) + '</div>' : ''}
+ <div>${tels(r).map(x => `<a class="tel" href="tel:${x}">📞 ${x}</a>`).join('')}</div>
+ <div class="q">1. ผลการโทร</div>${radios('call_result', ['ติดต่อได้', 'ไม่รับสาย/ปิดเครื่อง', 'เบอร์ผิด/ไม่มีเบอร์นี้', 'ย้ายออกจากพื้นที่', 'เสียชีวิต'])}
+ <div id="sec2" class="hide">
+  <div class="q">2. ผู้รับสาย</div>${radios('respondent', ['ผู้ป่วยเอง', 'ผู้ดูแล', 'ญาติ', 'อสม./อื่นๆ'])}
+  <div class="q">3. หากน้ำท่วม จะย้ายหรือไม่</div>${radios('will_move', ['ย้าย', 'ไม่ย้าย', 'ยังไม่แน่ใจ'])}
+  <div id="secMove" class="hide">
+   <div class="q">4. ย้ายเมื่อไร</div>${radios('move_when', ['ทันทีที่มีประกาศเตือน', 'เมื่อน้ำเริ่มเข้าบ้าน', 'อื่นๆ'])}
+   <div class="q">5. ย้ายไปไหน</div>${radios('dest', ['ศูนย์อพยพ เย็นศิระ 3', 'ศูนย์อพยพ วัดจีน (โคกนาว)', 'ศูนย์อพยพ โรงเรียนหาดใหญ่รัฐประชาสรรค์ (ย.ร.ส.)', 'โรงพยาบาลค่ายเสนาณรงค์', 'ศูนย์พักพิงเทศบาลเมืองคอหงส์', 'บ้านญาติ/คนรู้จัก', 'ชั้นบนของบ้านตัวเอง', 'โรงพยาบาล', 'อื่นๆ'])}
+   <input id="dest_detail" placeholder="ระบุสถานที่ (ถ้าบ้านญาติ/อื่นๆ)">
+   <div class="q">6. ย้ายโดยใคร</div>${radios('by_whom', ['ครอบครัวพาไปเอง', 'ต้องให้หน่วยงานไปรับ'])}
+   <div id="secPick" class="hide">
+    <div class="q">7. การเคลื่อนย้าย</div>${radios('pickup_mode', ['ต้องใช้เปล/เตียงนอน', 'ต้องใช้รถเข็น', 'เดินได้แต่ต้องพยุง', 'เดินได้เอง'])}
+    <div class="q">ผู้ติดตามกี่คน</div><input id="companions" type="number" min="0" inputmode="numeric">
+   </div>
+   <div class="q">8. อุปกรณ์ที่ต้องมีที่ศูนย์/ปลายทาง</div>${checks('center_equipment', ['ออกซิเจน', 'เครื่องดูดเสมหะ', 'เตียงผู้ป่วย', 'ที่นอนลม', 'อื่นๆ'])}
+  </div>
+  <div id="secNo" class="hide"><div class="q">เหตุผลหลักที่ไม่ย้าย (เลือกข้อเดียว)</div>
+   <select id="no_move_reason"><option value=""></option>${['น้ำน่าจะท่วมไม่นาน', 'ไม่รู้จะไปไหน', 'ไม่มีใครพาไป', 'เดินทางลำบากเพราะมีอุปกรณ์การแพทย์', 'ขึ้นรถทหารไม่ไหว', 'ไม่รู้เวลารถมารับ', 'กลัวที่ศูนย์ไม่มีคนดูแล/อุปกรณ์ไม่พร้อม', 'ศูนย์พักพิงวุ่นวาย/ใช้สุขาไม่ได้', 'เตรียมยาไม่ทัน', 'อื่นๆ'].map(o => `<option>${o}</option>`).join('')}</select></div>
+  <div class="q">9. รถหรือคนที่ใช้บริการประจำ</div><div class="mut">ถ้ามี แจ้งว่ามูลนิธิ รพ.สงขลานครินทร์ สนับสนุนค่ารถ 700 บาท ไป-กลับ</div>${radios('regular_ride', ['มี', 'ไม่มี'])}
+  <div id="secRide" class="hide"><input id="ride_name" placeholder="ชื่อรถ/คนขับ" style="margin-bottom:6px"><input id="ride_phone" inputmode="tel" placeholder="เบอร์รถ/คนขับ">
+   <div class="q">9.1 ถ้าน้ำท่วม จะใช้รถคันนี้ไปเองไหม</div>${radios('ride_use', ['ใช้รถนี้ไปเอง', 'ไม่ใช้ ยังต้องให้หน่วยงานไปรับ'])}</div>
+  <div class="q">ระดับความเร่งด่วนหลังคุย (ถ้าต่างจากที่ระบบให้)</div>${radios('color_confirm', ['แดง', 'เหลือง', 'เขียว'])}
+ </div>
+ <div class="q">เบอร์ใหม่ (ถ้ามี)</div><input id="new_phone" inputmode="tel">
+ <div class="q">หมายเหตุ</div><textarea id="note" rows="2"></textarea>
+ <div class="row" style="margin-top:12px"><button class="ghost" onclick="cancelForm()">ยกเลิก</button><button id="btnSave" onclick="save()">บันทึก</button></div>
+ <div id="ferr" class="err"></div></div>`;
+  const on = (n, f) => document.querySelectorAll(`[name="${n}"]`).forEach(e => e.onchange = f);
+  on('call_result', () => $('sec2').classList.toggle('hide', val('call_result') !== 'ติดต่อได้'));
+  on('will_move', () => { const v = val('will_move'); $('secMove').classList.toggle('hide', v !== 'ย้าย'); $('secNo').classList.toggle('hide', v !== 'ไม่ย้าย'); });
+  on('regular_ride', () => $('secRide').classList.toggle('hide', val('regular_ride') !== 'มี'));
+  on('by_whom', () => $('secPick').classList.toggle('hide', val('by_whom') !== 'ต้องให้หน่วยงานไปรับ'));
+  show('form');
+}
+function val(n) { const e = document.querySelector(`[name="${n}"]:checked`); return e ? e.value : ''; }
+function vals(n) { return [...document.querySelectorAll(`[name="${n}"]:checked`)].map(e => e.value).join(', '); }
+async function cancelForm() { run('release', cur.pid).catch(() => { }); if (cur.st) cur.st.claimed_by = ''; show('list'); render(); }
+// Logic checks: answers that contradict each other must be resolved on the call, before saving.
+function logicCheck(d) {
+  if (d.regular_ride === 'มี' && !d.ride_use) return 'ข้อ 9.1: ถามต่อว่าถ้าน้ำท่วม จะใช้รถคันนี้ไปเองไหม';
+  if (d.by_whom === 'ต้องให้หน่วยงานไปรับ' && d.ride_use === 'ใช้รถนี้ไปเอง') return 'คำตอบขัดกัน: ข้อ 6 "ต้องให้หน่วยงานไปรับ" แต่ข้อ 9.1 "ใช้รถนี้ไปเอง" — ถามยืนยันแล้วแก้ข้อใดข้อหนึ่งให้ตรงกัน';
+  if (d.by_whom === 'ครอบครัวพาไปเอง' && d.ride_use === 'ไม่ใช้ ยังต้องให้หน่วยงานไปรับ') return 'คำตอบขัดกัน: ข้อ 6 "ครอบครัวพาไปเอง" แต่ข้อ 9.1 "ยังต้องให้หน่วยงานไปรับ" — ถามยืนยันแล้วแก้ข้อใดข้อหนึ่งให้ตรงกัน';
+  return '';
+}
+async function save() {
+  const cr = val('call_result'); if (!cr) { $('ferr').textContent = 'กรุณาเลือกผลการโทร'; return; }
+  const ok = cr === 'ติดต่อได้', mv = ok && val('will_move') === 'ย้าย';
+  if (ok && !val('will_move')) { $('ferr').textContent = 'กรุณาเลือกว่าจะย้ายหรือไม่'; return; }
+  const d = { pid: cur.pid, name: cur.name, call_result: cr, respondent: ok ? val('respondent') : '', will_move: ok ? val('will_move') : '',
+    move_when: mv ? val('move_when') : '', dest: mv ? val('dest') : '', dest_detail: mv ? $('dest_detail').value : '', by_whom: mv ? val('by_whom') : '',
+    pickup_mode: mv && val('by_whom') === 'ต้องให้หน่วยงานไปรับ' ? val('pickup_mode') : '', companions: mv ? $('companions').value : '',
+    center_equipment: mv ? vals('center_equipment') : '', no_move_reason: ok && val('will_move') === 'ไม่ย้าย' ? $('no_move_reason').value : '',
+    color_confirm: ok ? val('color_confirm') : '', regular_ride: ok ? val('regular_ride') : '',
+    ride_name: ok && val('regular_ride') === 'มี' ? $('ride_name').value.trim() : '', ride_phone: ok && val('regular_ride') === 'มี' ? $('ride_phone').value.trim() : '', ride_use: ok && val('regular_ride') === 'มี' ? val('ride_use') : '', new_phone: $('new_phone').value.trim(), note: $('note').value.trim() };
+  const lc = logicCheck(d); if (lc) { $('ferr').textContent = lc; return; }
+  $('btnSave').disabled = true; $('btnSave').textContent = 'กำลังบันทึก...';
+  try {
+    const r = await run('submit', d);
+    if (r && r.ok === false) { $('ferr').textContent = r.msg; $('btnSave').disabled = false; $('btnSave').textContent = 'บันทึก'; return; }
+    cur.st = Object.assign(cur.st || {}, { status: r.status, attempts: r.attempts, claimed_by: '', will_move: d.will_move, dest: d.dest, by_whom: d.by_whom, new_phone: d.new_phone || (cur.st && cur.st.new_phone) });
+    show('list'); render();
+  } catch (e) { $('ferr').textContent = 'บันทึกไม่สำเร็จ ลองอีกครั้ง (' + (e.message || e) + ')'; $('btnSave').disabled = false; $('btnSave').textContent = 'บันทึก'; }
+}
+async function loadSummary() {
+  show('sum'); $('vSum').innerHTML = '<p class="mut">กำลังโหลด...</p>'; const s = await run('getSummary');
+  const kv = o => Object.entries(o).sort((a, b) => b[1] - a[1]).map(([k, v]) => `<div>${esc(k)}<b>${v}</b></div>`).join('') || '<div class="mut">ยังไม่มี</div>';
+  $('vSum').innerHTML = `<div class="tabs"><button class="ghost" onclick="show('list')">รายชื่อ</button><button onclick="loadSummary()">สรุปผล</button></div>
+ <div class="stat"><div>ทั้งหมด<b>${s.total}</b></div><div>โทรแล้ว<b>${s.called}</b></div><div>คุยสำเร็จ<b>${s.done}</b></div><div>โทรไม่ติด ≥3 ครั้ง (ให้ อสม. เยี่ยม)<b>${s.noanswer3}</b></div>
+ <div>จะย้าย<b>${s.move}</b></div><div>ไม่ย้าย<b>${s.nomove}</b></div><div>ยังไม่แน่ใจ<b>${s.unsure}</b></div><div>ต้องให้หน่วยงานไปรับ<b>${s.pickup}</b></div>
+ <div>ตอบข้อ 9 ว่ามีรถประจำ<b>${s.ride}</b></div><div>จะใช้รถประจำไปเอง<b>${s.rideSelf}</b></div><div>ขอให้ไปรับ + มีรถประจำ ยังไม่ถามข้อ 9.1 (โทรกลับถาม)<b>${s.pickupUnconfirmed}</b></div></div>
+ <div class="q" style="margin-top:14px">ปลายทาง</div><div class="stat">${kv(s.dest)}</div>
+ <div class="q" style="margin-top:14px">ต้องไปรับ แยกตามตำบล</div><div class="stat">${kv(s.pickupByTambon)}</div>`;
+}
+
+// ===================== boot =====================
+if (!window.crypto || !crypto.subtle) { $('lerr').textContent = 'เบราว์เซอร์นี้ใช้งานไม่ได้ (ต้องเปิดผ่าน https)'; }
+showProfiles();
+</script></body></html>
