@@ -14,7 +14,7 @@
       status.json  latest result per person (written with ETag If-Match = no lost updates)
       results/     one JSON file per call (If-None-Match:* = never overwritten)
       names.csv    optional: username,display_name (no passwords)
-  version: 2026-11-08 v3 (login error split: network / refused; weak ETag fix)
+  version: 2026-11-08 v3.1 (saved login no longer pins the folder; v3: login error split, real-folder first)
 -->
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--ink:#1d2330;--mut:#667085;--line:#e3e6eb;--red:#c62828;--redbg:#fde8e7;--yel:#a76b00;--yelbg:#fff4d6;--grn:#2e7d32;--pri:#1f5fbf}
@@ -248,7 +248,7 @@ async function doLogin() {
     if (rem) {
       const salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
       const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await pinKey($('pin1').value, salt), new TextEncoder().encode(pass)));
-      const P = profiles(); P[S.uid] = { user: S.user, uid: S.uid, name: S.name, dir: S.dir, salt: b64(salt), iv: b64(iv), ct: b64(ct), fails: 0 }; saveProfiles(P);
+      const P = profiles(); P[S.uid] = { user: S.user, uid: S.uid, name: S.name, dirManual: $('dirIn').value.trim(), salt: b64(salt), iv: b64(iv), ct: b64(ct), fails: 0 }; saveProfiles(P);
     }
     $('p').value = ''; $('pin1').value = ''; $('pin2').value = '';
     start();
@@ -267,7 +267,9 @@ async function doUnlock() {
     saveProfiles(P); $('lerr').textContent = 'PIN ไม่ถูกต้อง (เหลืออีก ' + (CFG.PIN_TRIES - pr.fails) + ' ครั้ง)'; return;
   }
   pr.fails = 0; saveProfiles(P);
-  try { await connect(pr.user, pass, pr.dir); start(); }
+  // Only a folder the user typed in by hand is remembered; otherwise search CFG.DIRS again (so oc_app_real is found after go-live).
+  // Profiles saved by v3 kept the auto-found folder in pr.dir — ignored on purpose.
+  try { await connect(pr.user, pass, pr.dirManual || ''); start(); }
   catch (e) {
     if (e.message === 'AUTH') { delete P[pendingProfile]; saveProfiles(P); $('lerr').textContent = 'App password นี้ถูกยกเลิกแล้วที่ oc2 — ลบออกจากเครื่องนี้แล้ว เข้าใหม่ด้วย App password ตัวใหม่'; showNew(true); }
     else $('lerr').textContent = loginErr(await diagnose(e, true));
