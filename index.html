@@ -14,7 +14,7 @@
       status.json  latest result per person (written with ETag If-Match = no lost updates)
       results/     one JSON file per call (If-None-Match:* = never overwritten)
       names.csv    optional: username,display_name (no passwords)
-  version: 2026-11-08 v2 (weak ETag fix + visible errors)
+  version: 2026-11-08 v3 (login error split: network / refused; weak ETag fix)
 -->
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--ink:#1d2330;--mut:#667085;--line:#e3e6eb;--red:#c62828;--redbg:#fde8e7;--yel:#a76b00;--yelbg:#fff4d6;--grn:#2e7d32;--pri:#1f5fbf}
@@ -44,6 +44,7 @@ button:disabled{opacity:.6}
 a{color:var(--pri)}
 </style></head><body>
 <header><b>โทรติดตามกลุ่มเปราะบาง</b><span><small id="me"></small> <button id="btnOut" class="ghost hide" style="font-size:13px;padding:5px 10px;margin-left:6px" onclick="doLogout()">ออกจากระบบ</button></span></header>
+<div id="mode" class="hide" style="padding:6px 14px;font-size:14px;font-weight:600;text-align:center"></div>
 <div class="wrap">
  <div id="vLogin" class="card">
   <!-- A: saved people on this device -->
@@ -74,7 +75,7 @@ a{color:var(--pri)}
    <div class="row" style="margin-top:10px"><button class="ghost hide" id="btnBack" onclick="showProfiles()">ย้อนกลับ</button><button id="btnLogin" onclick="doLogin()">เข้าสู่ระบบ</button></div>
    <details style="margin-top:10px"><summary class="mut">ตั้งค่าโฟลเดอร์ (เฉพาะเมื่อผู้ดูแลแจ้ง)</summary><input id="dirIn" placeholder="เช่น oc_app_real" style="margin-top:6px"></details>
   </div>
-  <div id="lerr" class="err" style="margin-top:8px"></div>
+  <div id="lerr" class="err" style="margin-top:8px;white-space:pre-line"></div>
   <div class="note">🔒 หน้านี้ส่งข้อมูลตรงไปที่ oc2.dida.psu.ac.th ของ ม.อ. เท่านั้น ไม่ผ่านระบบอื่น · รหัสไม่ถูกเก็บในหน้าเว็บ</div>
  </div>
  <div id="vList" class="hide">
@@ -99,7 +100,10 @@ const CFG = {
   OC_URL: 'https://oc2.dida.psu.ac.th',
   // Folder of the call data inside each person's oc2 view. Tried in order; the first one that has list.csv wins.
   // Owner sees the full path; people the folder is shared with see it at their top level (or under Shared/).
-  DIRS: ['project_Cowork/active_project/list_special_pop/oc_app_test', 'oc_app_test', 'Shared/oc_app_test'],
+  // Real data first; while oc_app_real does not exist yet (or is not shared to you) the test folder is used.
+  // To practise on the test data after go-live: login -> "ตั้งค่าโฟลเดอร์" -> type oc_app_test.
+  DIRS: ['project_Cowork/active_project/list_special_pop/oc_app_real', 'oc_app_real', 'Shared/oc_app_real',
+         'project_Cowork/active_project/list_special_pop/oc_app_test', 'oc_app_test', 'Shared/oc_app_test'],
   CLAIM_MIN: 20,      // a claimed case is held for this many minutes
   IDLE_MIN: 30,       // lock the page (back to PIN) after this many idle minutes
   PIN_TRIES: 5,       // wrong PINs before the saved password is wiped from this device
@@ -212,10 +216,24 @@ async function connect(user, pass, dirOverride) {
 }
 function loginErr(e) {
   const m = String(e && e.message || e);
-  if (m === 'AUTH') return 'ชื่อผู้ใช้หรือ App password ไม่ถูกต้อง';
-  if (m === 'NODIR') return 'เข้า oc2 ได้ แต่ไม่พบโฟลเดอร์งานโทร — ยังไม่ได้รับแชร์โฟลเดอร์ หรือชื่อโฟลเดอร์ไม่ตรง';
-  if (m === 'NET') return 'เข้าไม่ได้ — ชื่อผู้ใช้หรือ App password ไม่ถูก, หรือยังไม่ได้เพิ่มโดเมนนี้ใน oc2 → Settings → Security → CORS, หรืออินเทอร์เน็ตมีปัญหา';
+  if (m === 'AUTH') return 'ชื่อผู้ใช้หรือ App password ไม่ถูกต้อง — ชื่อผู้ใช้เป็นตัวเล็กแบบที่ใช้เข้า oc2 · App password คัดลอกให้ครบ ไม่มีเว้นวรรค';
+  if (m === 'NODIR') return 'เข้า oc2 ได้ แต่ไม่พบโฟลเดอร์งานโทร — ยังไม่ได้รับแชร์โฟลเดอร์ หรือชื่อโฟลเดอร์ไม่ตรง (แจ้งผู้ดูแล)';
+  if (m === 'OFFLINE') return 'ติดต่อ oc2 ไม่ได้เลย — อินเทอร์เน็ตหลุด หรือเครือข่ายนี้เข้า oc2 ไม่ได้\nลองเปิด https://oc2.dida.psu.ac.th ในแท็บใหม่ ถ้าเปิดไม่ได้เหมือนกัน = ปัญหาเน็ต ไม่ใช่รหัส';
+  if (m === 'BLOCKED_SEEN') return 'เครื่องนี้เคยเข้าได้ แต่ตอนนี้ oc2 ไม่ยอมให้เข้า — ส่วนใหญ่เพราะ App password ตัวนี้ถูกลบที่ oc2 แล้ว (หรือโดเมนถูกลบออกจาก CORS)\nกดลิงก์ "ลืมฉันจากเครื่องนี้" ด้านบน แล้วเข้าใหม่ด้วย App password ตัวใหม่';
+  if (m === 'NET' || m === 'BLOCKED') return 'oc2 ไม่ยอมให้หน้านี้เข้า — เกิดจาก 1 ใน 2 อย่างนี้:\n'
+    + '1) ยังไม่ได้เพิ่มโดเมน ' + location.origin + ' ใน oc2 → Settings → Security → CORS (ทำครั้งเดียวต่อบัญชี)\n'
+    + '2) ชื่อผู้ใช้หรือ App password ไม่ถูก (ชื่อผู้ใช้ตัวเล็ก · App password คัดลอกให้ครบ)\n'
+    + 'ถ้าข้อ 1 ทำแล้ว แปลว่าเป็นข้อ 2';
   return m;
+}
+// After a failed login: was it the network, or did oc2 answer but refuse this page (wrong password / no CORS)?
+// A browser cannot tell those last two apart (oc2 sends no CORS header to an unknown user), so we only split off the network case.
+async function diagnose(e, seenBefore) {
+  if (!e || e.message !== 'NET') return e;
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return new Error('OFFLINE');
+  try { await fetch(CFG.OC_URL + '/status.php', { mode: 'no-cors', cache: 'no-store', credentials: 'omit' }); }
+  catch (x) { return new Error('OFFLINE'); }
+  return new Error(seenBefore ? 'BLOCKED_SEEN' : 'BLOCKED');
 }
 async function doLogin() {
   const user = $('u').value.trim(), pass = $('p').value.trim(), rem = $('rem').checked;
@@ -234,7 +252,7 @@ async function doLogin() {
     }
     $('p').value = ''; $('pin1').value = ''; $('pin2').value = '';
     start();
-  } catch (e) { S = { user: '', uid: '', pass: '', name: '', dir: '' }; $('lerr').textContent = loginErr(e); }
+  } catch (e) { S = { user: '', uid: '', pass: '', name: '', dir: '' }; $('lerr').textContent = loginErr(await diagnose(e, false)); }
   finally { $('btnLogin').disabled = false; }
 }
 async function doUnlock() {
@@ -252,7 +270,7 @@ async function doUnlock() {
   try { await connect(pr.user, pass, pr.dir); start(); }
   catch (e) {
     if (e.message === 'AUTH') { delete P[pendingProfile]; saveProfiles(P); $('lerr').textContent = 'App password นี้ถูกยกเลิกแล้วที่ oc2 — ลบออกจากเครื่องนี้แล้ว เข้าใหม่ด้วย App password ตัวใหม่'; showNew(true); }
-    else $('lerr').textContent = loginErr(e);
+    else $('lerr').textContent = loginErr(await diagnose(e, true));
   }
 }
 function forgetProfile() {
@@ -356,6 +374,9 @@ async function run(fn, ...a) {
 // ===================== screens (same as the team's current form) =====================
 async function doLogout() { if (cur && !$('vForm').classList.contains('hide') && !confirm('ยังไม่ได้บันทึกเคสนี้ ออกจากระบบเลยไหม')) return; try { await run('logout'); } catch (e) { } S = { user: '', uid: '', pass: '', name: '', dir: '' }; location.reload(); }
 async function start() {
+  const test = /oc_app_test$/.test(S.dir), mb = $('mode');
+  mb.textContent = test ? 'โหมดทดสอบ · ข้อมูลสมมติ (' + S.dir.split('/').pop() + ') — ผลที่บันทึกไม่ใช่ของจริง' : 'ข้อมูลจริง · ' + S.dir.split('/').pop();
+  mb.style.background = test ? '#fff4d6' : '#e6f4ea'; mb.style.color = test ? '#a76b00' : '#2e7d32'; mb.classList.remove('hide');
   $('me').textContent = S.name; $('btnOut').classList.remove('hide'); $('vLogin').classList.add('hide'); show('list'); bumpIdle();
   $('list').innerHTML = '<p class="mut">กำลังโหลดรายชื่อ...</p>';
   try { ALL = await run('getList'); } catch (e) { $('list').innerHTML = '<p class="err">โหลดรายชื่อไม่ได้: ' + esc(e.message || e) + '</p>'; return; }
